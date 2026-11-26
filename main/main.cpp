@@ -64,6 +64,9 @@
 #if WEB_STATUS_SERVER_ENABLED
 #include "custom/web_status.h"
 #endif
+#if WEB_STATUS_SERVER_ENABLED && SERIAL_CONSOLE_ENABLED
+#include "custom/serial_console.h"
+#endif
 #include "custom/determine_stack_sizes.h"
 #include "custom/health_check.h"
 #include "custom/leap_seconds.h"
@@ -11985,6 +11988,9 @@ static void validate_board_configuration()
 
 extern "C" void app_main()
 {
+#if WEB_STATUS_SERVER_ENABLED && SERIAL_CONSOLE_ENABLED
+    serial_console::init(); // tee the serial console as early as possible so the web status page can show a live tail
+#endif
 
     check_NTP_and_PTP_settings();
 

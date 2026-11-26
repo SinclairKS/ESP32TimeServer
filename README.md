@@ -92,9 +92,10 @@ so it cannot affect a u-blox build.
 
 ### Web status server
 
-A small, **read-only** HTTP status server is added. It exposes the same state
-the firmware already maintains for MQTT reporting — it never touches the PPS
-discipline path, the GNSS processing, or the NTP reply path.
+A small HTTP status server is added. It exposes the same state the firmware
+already maintains for MQTT reporting — it never touches the PPS discipline
+path, the GNSS processing, or the NTP reply path. It is read-only except for
+one privileged action, `POST /reboot`, which is gated by the OTE password.
 
 - **Endpoints**
   - `GET /` — a single-page "command deck" dashboard (a live clock, an uptime
@@ -102,14 +103,36 @@ discipline path, the GNSS processing, or the NTP reply path.
     polls `/status` every two seconds. No external assets, so it works with no
     internet access.
   - `GET /status` — the same data as JSON.
+  - `GET /console?since=<seq>` — a live tail of the serial console as plain
+    text, for debugging (see the **Console** bullet below). The sequence number
+    for the next poll is returned in the `X-Console-Seq` header; if log data
+    was lost to the buffer wrapping, an `X-Console-Dropped` header reports it.
+    The dashboard shows a live tail in a panel at the bottom of the page
+    (collapsed by default; polling every two seconds, with pause/clear
+    controls).
+  - `POST /reboot` — reboots the device. Requires the **OTE password** as a
+    Bearer token (`Authorization: Bearer <password>`), exactly like the OTE
+    upload endpoint, so no new credential is introduced. The dashboard's
+    **reboot** button (top right) prompts for the password and calls this
+    endpoint; on success the page reports "rebooting..." and the device
+    resets within a second.
 - **Clock** — the dashboard's live clock and the `epoch` field report **UTC**,
   the same scale the NTP server hands to clients, so the page matches
   https://time.is. Upstream 4.0.X keeps the system wall clock in continuous
   TAI (it is only converted to UTC at the NTP reply path), so the fork converts
   the reading through the standard TAI → UTC leap-second table (`utc_now()`)
   before displaying it; without that the page would run ~37 s fast.
-- **Configuration** — `WEB_STATUS_SERVER_ENABLED` (default `1` in this fork)
-  and `WebStatusPort` (default `80`).
+- **Configuration** — `WEB_STATUS_SERVER_ENABLED` (default `1` in this fork),
+  `WebStatusPort` (default `80`), and `SERIAL_CONSOLE_ENABLED` (default `1`)
+  for the console tail.
+- **Console** — the application console (ESP_LOG output) is tee'd into a 16 KB
+  lock-free ring buffer and shown in the dashboard (and served at
+  `GET /console`), which is handy for debugging when the serial port is not
+  reachable. The physical serial console is byte-for-byte unchanged (the tee
+  only appends to the buffer). Limitations: ROM/bootloader output from before
+  `app_main` is not captured, and lines compiled out (`DEBUG_ENABLED 0`) never
+  appear. Anything the firmware logs is visible over HTTP, so treat the
+  console like the rest of the page (trusted LAN only).
 - **Isolation** — the server runs on **FreeRTOS core 0** at **priority 5**
   (below every time-sensitive task, which stay pinned to core 1 and the
   higher-priority NTP tasks), with a 4 KB stack and a fixed-size response
@@ -121,11 +144,11 @@ discipline path, the GNSS processing, or the NTP reply path.
   field is length-bounded so the fixed buffer cannot overflow.
 
 > **Security note:** the status server has **no authentication** and is intended
-> for a trusted LAN only. Anyone on the same network can read the page and the
-> `/status` JSON (which includes the device IP, firmware version, and counters).
-> There is no write or control path. If you want it on a network you do not
-> fully trust, either disable it (`WEB_STATUS_SERVER_ENABLED 0`) or segment the
-> device onto a separate VLAN.
+> for a trusted LAN only. Anyone on the same network can read the page, the
+> `/status` JSON (which includes the device IP, firmware version, and counters),
+> and the live serial console tail. There is no write or control path. If you
+> want it on a network you do not fully trust, either disable it
+> (`WEB_STATUS_SERVER_ENABLED 0`) or segment the device onto a separate VLAN.
 
 ### Supporting changes
 
@@ -153,7 +176,7 @@ described in the **Setup** section below.
 #### Applying the fork as a patch (instead of cloning it)
 
 The complete fork change set is also carried as a single unified diff,
-`patches/mtk-web-status-full-v40.patch` (five files: three modified, two
+`patches/mtk-web-status-full-v40.patch` (nine files: five modified, four
 added). If you would rather keep a pristine upstream checkout, apply the
 patch onto the upstream commit it was generated against:
 

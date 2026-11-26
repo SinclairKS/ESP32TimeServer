@@ -2,17 +2,20 @@
 // License: MIT
 // Website: https://github.com/SinclairKS/ESP32TimeServer
 //
-// Read-only web status server.
+// Web status server.
 //
-// This is a *small* auxiliary server whose only job is to expose the
-// system status information (time, sync/PPS state, NTP and GNSS counters,
-// memory) as a human readable page and as JSON, for monitoring purposes.
+// This is a *small* auxiliary server whose main job is to expose the system
+// status information (time, sync/PPS state, NTP and GNSS counters, memory)
+// as a human readable page and as JSON, for monitoring purposes. It also
+// exposes one privileged action: an authenticated reboot.
 //
 // Design constraints (important for a Stratum 1 time server):
 //
-// 1. It is read-only. It never touches the PPS discipline path, the GNSS
-//    processing, or the NTP reply path - it only reads atomics / snapshots
-//    that are already maintained for MQTT reporting.
+// 1. It is read-only, with one exception: POST /reboot, which is gated by
+//    the OTE password (the same Bearer check the OTE upload endpoint uses).
+//    It never touches the PPS discipline path, the GNSS processing, or the
+//    NTP reply path - it only reads atomics / snapshots that are already
+//    maintained for MQTT reporting.
 //
 // 2. It runs on FreeRTOS core 0 at a low priority (below every time
 //    sensitive task) so that occasional HTML/JSON rendering can never
@@ -31,15 +34,29 @@
 #include "web_status.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
 
 extern "C"
 {
+#include "arpa/inet.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "lwip/sockets.h"
+#include "netinet/in.h"
+#include "sys/socket.h"
 }
+
+#if SERIAL_CONSOLE_ENABLED
+#include "serial_console.h"
+#endif
+
+#include "native_ote.h"
 
 static const char *TAG = "web_status";
 
@@ -61,6 +78,40 @@ static httpd_handle_t s_web_server = nullptr;
 // single-task, serial-dispatch model above is what makes it safe.)
 static char s_web_status_response[WEB_STATUS_RESPONSE_SIZE] = "";
 
+#if SERIAL_CONSOLE_ENABLED
+// Reused for every /console response. Same single-task safety argument as
+// s_web_status_response above.
+static constexpr size_t CONSOLE_MAX_RESPONSE_BYTES = 4096;
+static char s_console_buffer[CONSOLE_MAX_RESPONSE_BYTES];
+
+// Tail of the serial console since the cursor the page last reported. The
+// text goes in the body; the sequence number (and any wrap gap) go in
+// headers, so no JSON escaping is needed for raw console text.
+static esp_err_t web_status_console_handler(httpd_req_t *req)
+{
+    char query[32] = "";
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+    uint64_t since = 0;
+    if (std::strncmp(query, "since=", 6) == 0)
+        since = strtoull(query + 6, nullptr, 10);
+
+    const serial_console::drain_result_t r =
+        serial_console::drain(since, s_console_buffer, sizeof(s_console_buffer));
+
+    char num[24];
+    snprintf(num, sizeof(num), "%llu", static_cast<unsigned long long>(r.new_seq));
+    httpd_resp_set_hdr(req, "X-Console-Seq", num);
+    if (r.dropped > 0)
+    {
+        snprintf(num, sizeof(num), "%llu", static_cast<unsigned long long>(r.dropped));
+        httpd_resp_set_hdr(req, "X-Console-Dropped", num);
+    }
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, s_console_buffer, static_cast<int>(r.bytes));
+}
+#endif // SERIAL_CONSOLE_ENABLED
+
 // Filled in by main.cpp from its private status state (atomics / snapshots)
 
 void web_status_fill_snapshot(web_status_snapshot_t *s);
@@ -74,8 +125,8 @@ static esp_err_t web_status_json_handler(httpd_req_t *req)
     size_t size = WEB_STATUS_RESPONSE_SIZE;
     size_t len = 0;
 
-    len += static_cast<size_t>(snprintf(buf + len, size - len,
-                                        "{\"app\":\"%s\","
+    const int written = snprintf(buf + len, size - len,
+                                 "{\"app\":\"%s\","
                                         "\"version\":\"%s\","
                                         "\"git_sha\":\"%s\","
                                         "\"build_date\":\"%s %s\","
@@ -139,10 +190,17 @@ static esp_err_t web_status_json_handler(httpd_req_t *req)
                                         static_cast<unsigned int>(s.psram_free_bytes),
                                         s.has_psram ? "true" : "false",
                                         s.ethernet_connected ? "true" : "false",
-                                        s.ip));
+                                        s.ip);
 
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    // snprintf reports the length that WOULD have been written had the
+    // buffer been large enough - never send more than what actually fit.
+    if (written < 0 || static_cast<size_t>(written) >= size - len)
+        return httpd_resp_send(req, "{\"error\":\"status response truncated\"}\n", HTTPD_RESP_USE_STRLEN);
+
+    len += static_cast<size_t>(written);
     return httpd_resp_send(req, buf, static_cast<int>(len));
 }
 
@@ -168,6 +226,8 @@ static constexpr char WEB_STATUS_HTML[] =
     ".up{text-align:right}"
     ".up .k{color:#8b98a5;font-size:11px;text-transform:uppercase;letter-spacing:.04em}"
     ".up .v{font-size:16px}"
+    ".up button{margin-top:10px;background:none;border:1px solid #f0616d66;color:#f0616d;border-radius:4px;padding:3px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;cursor:pointer}"
+    ".up button:hover{background:#f0616d1a}"
     ".pills{display:flex;flex-wrap:wrap;gap:8px;padding:12px 0;border-bottom:1px solid #2a3340}"
     ".pill{display:inline-flex;align-items:center;gap:6px;border:1px solid #2a3340;border-radius:999px;padding:3px 12px;font-size:12px;font-variant-numeric:tabular-nums}"
     ".pill.ok{color:#39d98a;border-color:#39d98a66}"
@@ -181,11 +241,18 @@ static constexpr char WEB_STATUS_HTML[] =
     ".v{font-size:14px;font-variant-numeric:tabular-nums;text-align:right}"
     ".ok{color:#39d98a}.warn{color:#f5c542}.bad{color:#f0616d}.off{color:#8b98a5}"
     "footer{margin-top:16px;color:#8b98a5;font-size:.8em}"
+    ".console{margin-top:18px}"
+    ".console summary{cursor:pointer;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#8b98a5;font-weight:600;padding:4px 0}"
+    "#console-box{margin-top:8px;background:#0a0e12;border:1px solid #2a3340;border-radius:6px;padding:10px;height:280px;overflow-y:auto;font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:#b8c4d0}"
+    ".console-ctl{display:flex;gap:8px;margin-top:6px;align-items:center}"
+    ".console-ctl button{background:none;border:1px solid #2a3340;color:#8b98a5;border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer}"
+    ".console-ctl button:hover{color:#dfe7ee}"
+    "#console-drop{color:#f5c542;font-size:11px}"
     "</style></head><body>"
     "<div class=\"wrap\">"
     "<div class=\"hero\">"
     "<div><div class=\"time\" id=\"clock\">--:--:--</div><div class=\"date\" id=\"date\"></div></div>"
-    "<div class=\"up\"><div class=\"k\">uptime</div><div class=\"v\" id=\"uptime\">-</div></div>"
+    "<div class=\"up\"><div class=\"k\">uptime</div><div class=\"v\" id=\"uptime\">-</div><button id=\"reboot\" type=\"button\">reboot</button></div>"
     "</div>"
     "<div class=\"pills\" id=\"pills\"></div>"
     "<div class=\"cols\">"
@@ -193,6 +260,15 @@ static constexpr char WEB_STATUS_HTML[] =
     "<div><div class=\"sec\">NTP</div><div id=\"col_ntp\"></div></div>"
     "<div><div class=\"sec\">System</div><div id=\"col_sys\"></div></div>"
     "</div>"
+    "<details class=\"console\">"
+    "<summary>Console (live serial log)</summary>"
+    "<div id=\"console-box\"></div>"
+    "<div class=\"console-ctl\">"
+    "<button id=\"console-pause\" type=\"button\">pause</button>"
+    "<button id=\"console-clear\" type=\"button\">clear</button>"
+    "<span id=\"console-drop\"></span>"
+    "</div>"
+    "</details>"
     "<footer id=\"foot\">loading...</footer>"
     "</div>"
     "<script>"
@@ -214,7 +290,7 @@ static constexpr char WEB_STATUS_HTML[] =
     "var since=s.last_successful_sync_us>0?Math.floor(s.uptime_seconds-s.last_successful_sync_us/1e6):0;"
     "document.getElementById('pills').innerHTML="
     "(s.stratum_one?pill('Stratum 1','ok'):pill('Stratum '+(s.stratum==16?'init':s.stratum),'warn'))+"
-    "pill(s.reference_id)+"
+    "pill(s.reference_id,s.reference_id==='INIT'?'':(s.holdover?'warn':'ok'))+"
     "(s.pps_active?pill('PPS ok','ok'):pill('PPS off'))+"
     "(s.satellites>0?pill(s.satellites+' sats','ok'):pill('0 sats'))+"
     "(s.ethernet_connected?pill('eth up','ok'):pill('eth down','bad'))+"
@@ -249,6 +325,14 @@ static constexpr char WEB_STATUS_HTML[] =
     "}catch(e){document.getElementById('foot').textContent='status unavailable: '+e}"
     "}"
     "refresh();setInterval(refresh,2000);"
+    "var cseq=0,cpaused=false,clines=[];"
+    "function cadd(t){if(!t)return;var p=t.split('\\n');for(var i=0;i<p.length;i++){if(p[i].length){clines.push(p[i]);if(clines.length>400)clines.splice(0,clines.length-400);}}}"
+    "function crender(){var b=document.getElementById('console-box');var stick=b.scrollHeight-b.scrollTop-b.clientHeight<30;b.innerHTML=clines.map(function(l){return l.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}).join('\\n');if(stick)b.scrollTop=b.scrollHeight;}"
+    "async function cpoll(){if(!cpaused){try{var r=await fetch('/console?since='+cseq);var ns=r.headers.get('X-Console-Seq');cseq=ns?parseInt(ns,10):0;var d=r.headers.get('X-Console-Dropped');document.getElementById('console-drop').textContent=d?('dropped '+d+' bytes (buffer full)'):'';cadd((await r.text()).replace(/\\u001b\\[[0-9;]*m/g,''));crender();}catch(e){}}setTimeout(cpoll,2000);}"
+    "document.getElementById('console-pause').onclick=function(){cpaused=!cpaused;this.textContent=cpaused?'resume':'pause';};"
+    "document.getElementById('console-clear').onclick=function(){clines.length=0;crender();};"
+    "document.getElementById('reboot').onclick=function(){var pw=prompt('Reboot the ESP32? Enter the OTE password:');if(pw===null)return;fetch('/reboot',{method:'POST',headers:{'Authorization':'Bearer '+pw}}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t||String(r.status));return t;});}).then(function(){document.getElementById('foot').textContent='rebooting...';}).catch(function(e){alert('reboot failed: '+e);});};"
+    "cpoll();"
     "</script></body></html>";
 
 static esp_err_t web_status_index_handler(httpd_req_t *req)
@@ -257,6 +341,84 @@ static esp_err_t web_status_index_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, WEB_STATUS_HTML, HTTPD_RESP_USE_STRLEN);
 }
+
+#if OTE_UPDATES_ENABLED
+// Format a request's client address as text ("a.b.c.d" or IPv6) and report
+// its port. IDF v6.1's httpd_req_t no longer carries the peer address; the
+// session socket is exposed via httpd_req_to_sockfd() and getpeername()
+// reports both the address family and the port. On failure buf gets
+// "unknown" and the port stays 0.
+static void web_status_client_ip(httpd_req_t *req, char *buf, size_t cap, uint16_t *port_out)
+{
+    if (port_out != nullptr)
+        *port_out = 0;
+    if (req == nullptr)
+    {
+        std::snprintf(buf, cap, "unknown");
+        return;
+    }
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0)
+    {
+        std::snprintf(buf, cap, "unknown");
+        return;
+    }
+    struct sockaddr_storage peer{};
+    socklen_t peer_len = sizeof(peer);
+    if (getpeername(fd, reinterpret_cast<struct sockaddr *>(&peer), &peer_len) != 0)
+    {
+        std::snprintf(buf, cap, "unknown");
+        return;
+    }
+    if (peer.ss_family == AF_INET)
+    {
+        const struct sockaddr_in *v4 = reinterpret_cast<const struct sockaddr_in *>(&peer);
+        (void)inet_ntop(AF_INET, &v4->sin_addr, buf, static_cast<socklen_t>(cap));
+        if (port_out != nullptr)
+            *port_out = ntohs(v4->sin_port);
+    }
+    else if (peer.ss_family == AF_INET6)
+    {
+        const struct sockaddr_in6 *v6 = reinterpret_cast<const struct sockaddr_in6 *>(&peer);
+        (void)inet_ntop(AF_INET6, &v6->sin6_addr, buf, static_cast<socklen_t>(cap));
+        if (port_out != nullptr)
+            *port_out = ntohs(v6->sin6_port);
+    }
+    else
+    {
+        std::snprintf(buf, cap, "unknown");
+    }
+}
+
+// POST /reboot — reboots the device. Gated by the OTE password via the same
+// Bearer check the OTE upload endpoint uses, so no new credential exists.
+// The response is sent before the reset so the client sees "rebooting"
+// rather than a connection drop.
+static esp_err_t web_status_reboot_handler(httpd_req_t *req)
+{
+    char client_ip[INET6_ADDRSTRLEN] = "?";
+    uint16_t client_port = 0;
+    web_status_client_ip(req, client_ip, sizeof(client_ip), &client_port);
+
+    if (!native_ote_is_authenticated(req))
+    {
+        ESP_LOGW(TAG, "Reboot denied: missing or wrong OTE password (from %s:%u)",
+                 client_ip, static_cast<unsigned int>(client_port));
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
+        httpd_resp_set_type(req, "text/plain; charset=utf-8");
+        return httpd_resp_send(req, "reboot requires the OTE password\n", HTTPD_RESP_USE_STRLEN);
+    }
+
+    ESP_LOGW(TAG, "Reboot requested via web status page by %s:%u",
+             client_ip, static_cast<unsigned int>(client_port));
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_send(req, "rebooting\n", HTTPD_RESP_USE_STRLEN);
+    vTaskDelay(pdMS_TO_TICKS(100)); // let the response out the door first
+    esp_restart();
+    return ESP_FAIL; // unreachable
+}
+#endif
 
 void web_server_init()
 {
@@ -291,6 +453,22 @@ void web_server_init()
     status_uri.method = HTTP_GET;
     status_uri.handler = web_status_json_handler;
     httpd_register_uri_handler(s_web_server, &status_uri);
+
+#if SERIAL_CONSOLE_ENABLED
+    httpd_uri_t console_uri{};
+    console_uri.uri = "/console";
+    console_uri.method = HTTP_GET;
+    console_uri.handler = web_status_console_handler;
+    httpd_register_uri_handler(s_web_server, &console_uri);
+#endif
+
+#if OTE_UPDATES_ENABLED
+    httpd_uri_t reboot_uri{};
+    reboot_uri.uri = "/reboot";
+    reboot_uri.method = HTTP_POST;
+    reboot_uri.handler = web_status_reboot_handler;
+    httpd_register_uri_handler(s_web_server, &reboot_uri);
+#endif
 
     ESP_LOGI(TAG, "Web status server listening on port %u (core %d, priority %u)",
              WebStatusPort,

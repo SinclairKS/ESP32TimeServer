@@ -5,6 +5,7 @@ string(REGEX MATCH "#define[ \t]+PTP_L2_SERVER_ENABLED[ \t]+1" PTP_L2_SERVER_ENA
 string(REGEX MATCH "#define[ \t]+PTP_L2_AUTHENTICATION_ENABLED[ \t]+1" PTP_L2_AUTH_ENABLED "${TIME_SERVER_SETTINGS}")
 string(REGEX MATCH "#define[ \t]+NTP_AUTHENTICATION_ENABLED[ \t]+1" NTP_AUTH_ENABLED "${TIME_SERVER_SETTINGS}")
 string(REGEX MATCH "#define[ \t]+WEB_STATUS_SERVER_ENABLED[ \t]+1" WEB_STATUS_ENABLED "${TIME_SERVER_SETTINGS}")
+string(REGEX MATCH "#define[ \t]+SERIAL_CONSOLE_ENABLED[ \t]+1" SERIAL_CONSOLE_ENABLED "${TIME_SERVER_SETTINGS}")
 
 set(MAIN_SOURCES
         "main.cpp"
@@ -61,6 +62,9 @@ endif()
 if(WEB_STATUS_ENABLED)
     list(APPEND MAIN_SOURCES "custom/web_status.cpp")
     # note: esp_http_server is already listed unconditionally in MAIN_REQUIRES
+    if(SERIAL_CONSOLE_ENABLED)
+        list(APPEND MAIN_SOURCES "custom/serial_console.cpp")
+    endif()
 endif()
 
 idf_component_register(

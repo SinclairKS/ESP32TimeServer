@@ -148,6 +148,14 @@ static constexpr unsigned int OTEMaxUploadTimeSeconds = 300;
 #define WEB_STATUS_SERVER_ENABLED 1 // 0 = Disabled; 1 = Enabled
 static constexpr uint16_t WebStatusPort = 80;
 
+// (optional) live serial console tail on the web status page
+// The application console (ESP_LOG output) is tee'd into a 16 KB ring buffer
+// and served at http://<ip>/console; the dashboard shows a live tail of it in
+// a panel at the bottom of the page. Read-only - it only shows what the
+// firmware logs. Note that lines compiled out (DEBUG_ENABLED 0) never appear,
+// and ROM/bootloader output (before app_main) is not captured.
+#define SERIAL_CONSOLE_ENABLED 1 // 0 = Disabled; 1 = Enabled
+
 // (Optional) MQTT reporting support
 // MQTT_ENABLED provides for current system status and activity reporting on information such as:
 // uptime, number of active satellites, ntp request counts, etc.

@@ -1,32 +1,36 @@
 diff --git a/main/CMakeLists.txt b/main/CMakeLists.txt
-index 4da9e90..5ba1d2c 100644
+index 4da9e90..dcafde9 100644
 --- a/main/CMakeLists.txt
 +++ b/main/CMakeLists.txt
-@@ -4,6 +4,7 @@ string(REGEX MATCH "#define[ \t]+NTP_SERVER_ENABLED[ \t]+1" NTP_SERVER_ENABLED "
+@@ -4,6 +4,8 @@ string(REGEX MATCH "#define[ \t]+NTP_SERVER_ENABLED[ \t]+1" NTP_SERVER_ENABLED "
  string(REGEX MATCH "#define[ \t]+PTP_L2_SERVER_ENABLED[ \t]+1" PTP_L2_SERVER_ENABLED "${TIME_SERVER_SETTINGS}")
  string(REGEX MATCH "#define[ \t]+PTP_L2_AUTHENTICATION_ENABLED[ \t]+1" PTP_L2_AUTH_ENABLED "${TIME_SERVER_SETTINGS}")
  string(REGEX MATCH "#define[ \t]+NTP_AUTHENTICATION_ENABLED[ \t]+1" NTP_AUTH_ENABLED "${TIME_SERVER_SETTINGS}")
 +string(REGEX MATCH "#define[ \t]+WEB_STATUS_SERVER_ENABLED[ \t]+1" WEB_STATUS_ENABLED "${TIME_SERVER_SETTINGS}")
++string(REGEX MATCH "#define[ \t]+SERIAL_CONSOLE_ENABLED[ \t]+1" SERIAL_CONSOLE_ENABLED "${TIME_SERVER_SETTINGS}")
  
  set(MAIN_SOURCES
          "main.cpp"
-@@ -57,6 +58,11 @@ if(PTP_L2_SERVER_ENABLED AND PTP_L2_AUTH_ENABLED)
+@@ -57,6 +59,14 @@ if(PTP_L2_SERVER_ENABLED AND PTP_L2_AUTH_ENABLED)
      list(APPEND MAIN_REQUIRES mbedtls)
  endif()
  
 +if(WEB_STATUS_ENABLED)
 +    list(APPEND MAIN_SOURCES "custom/web_status.cpp")
 +    # note: esp_http_server is already listed unconditionally in MAIN_REQUIRES
++    if(SERIAL_CONSOLE_ENABLED)
++        list(APPEND MAIN_SOURCES "custom/serial_console.cpp")
++    endif()
 +endif()
 +
  idf_component_register(
      SRCS ${MAIN_SOURCES}
      INCLUDE_DIRS
 diff --git a/main/ESP32TimeServerSettings.h b/main/ESP32TimeServerSettings.h
-index 1f0ef4e..3b36b1c 100644
+index 1f0ef4e..cbf457d 100644
 --- a/main/ESP32TimeServerSettings.h
 +++ b/main/ESP32TimeServerSettings.h
-@@ -140,6 +140,14 @@ static constexpr uint16_t OTEPort = 3232;
+@@ -140,6 +140,22 @@ static constexpr uint16_t OTEPort = 3232;
  static constexpr unsigned int OTEReceiveTimeoutSeconds = 15;
  static constexpr unsigned int OTEMaxUploadTimeSeconds = 300;
  
@@ -38,10 +42,18 @@ index 1f0ef4e..3b36b1c 100644
 +#define WEB_STATUS_SERVER_ENABLED 1 // 0 = Disabled; 1 = Enabled
 +static constexpr uint16_t WebStatusPort = 80;
 +
++// (optional) live serial console tail on the web status page
++// The application console (ESP_LOG output) is tee'd into a 16 KB ring buffer
++// and served at http://<ip>/console; the dashboard shows a live tail of it in
++// a panel at the bottom of the page. Read-only - it only shows what the
++// firmware logs. Note that lines compiled out (DEBUG_ENABLED 0) never appear,
++// and ROM/bootloader output (before app_main) is not captured.
++#define SERIAL_CONSOLE_ENABLED 1 // 0 = Disabled; 1 = Enabled
++
  // (Optional) MQTT reporting support
  // MQTT_ENABLED provides for current system status and activity reporting on information such as:
  // uptime, number of active satellites, ntp request counts, etc.
-@@ -255,11 +263,11 @@ static constexpr const char *timeZoneSpec = "EST5EDT,M3.2.0/2,M11.1.0/2";
+@@ -255,11 +271,11 @@ static constexpr const char *timeZoneSpec = "EST5EDT,M3.2.0/2,M11.1.0/2";
  // 3. The GNSS GND must be connected to the ESP32 GND                                                     *
  // ********************************************************************************************************
  
@@ -55,27 +67,356 @@ index 1f0ef4e..3b36b1c 100644
  
  // Unless you know what you are doing, the options below should be left as is
  
+diff --git a/main/custom/native_ote.cpp b/main/custom/native_ote.cpp
+index 7d8e800..756b594 100644
+--- a/main/custom/native_ote.cpp
++++ b/main/custom/native_ote.cpp
+@@ -57,30 +57,33 @@ namespace
+         ESP_LOGE(TAG, "%s (%s)", reason, esp_err_to_name(error));
+         return send_response(request, status, reason);
+     }
++} // namespace
++
++bool native_ote_is_authenticated(httpd_req_t *request)
++{
++    char authorization[sizeof(OTEPassword) + 7]{};
++    const size_t password_length = strlen(OTEPassword);
++    if (password_length == 0 ||
++        httpd_req_get_hdr_value_len(request, "Authorization") != password_length + 7 ||
++        httpd_req_get_hdr_value_str(request, "Authorization", authorization, sizeof(authorization)) != ESP_OK ||
++        memcmp(authorization, "Bearer ", 7) != 0)
++        return false;
++
++    unsigned int difference = 0;
++    for (size_t index = 0; index < password_length; ++index)
++        difference |= static_cast<unsigned char>(authorization[index + 7]) ^
++                      static_cast<unsigned char>(OTEPassword[index]);
++    return difference == 0;
++}
+ 
++namespace
++{
+     static void report_progress(size_t written, size_t total)
+     {
+         if (s_callbacks.progress != nullptr)
+             s_callbacks.progress(static_cast<unsigned int>(written), static_cast<unsigned int>(total));
+     }
+ 
+-    static bool is_authenticated(httpd_req_t *request)
+-    {
+-        char authorization[sizeof(OTEPassword) + 7]{};
+-        const size_t password_length = strlen(OTEPassword);
+-        if (password_length == 0 ||
+-            httpd_req_get_hdr_value_len(request, "Authorization") != password_length + 7 ||
+-            httpd_req_get_hdr_value_str(request, "Authorization", authorization, sizeof(authorization)) != ESP_OK ||
+-            memcmp(authorization, "Bearer ", 7) != 0)
+-            return false;
+-
+-        unsigned int difference = 0;
+-        for (size_t index = 0; index < password_length; ++index)
+-            difference |= static_cast<unsigned char>(authorization[index + 7]) ^
+-                          static_cast<unsigned char>(OTEPassword[index]);
+-        return difference == 0;
+-    }
+-
+     static bool has_valid_content_length(httpd_req_t *request)
+     {
+         char value[24]{};
+@@ -141,7 +144,7 @@ namespace
+ 
+     static esp_err_t upload_handler(httpd_req_t *request)
+     {
+-        if (!is_authenticated(request))
++        if (!native_ote_is_authenticated(request))
+         {
+             httpd_resp_set_hdr(request, "WWW-Authenticate", "Bearer");
+             return send_response(request, "401 Unauthorized", "OTE authentication required\n");
+diff --git a/main/custom/native_ote.h b/main/custom/native_ote.h
+index 721ef61..85e7098 100644
+--- a/main/custom/native_ote.h
++++ b/main/custom/native_ote.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include "esp_err.h"
++#include "esp_http_server.h"
+ #include "esp_netif.h"
+ 
+ struct native_ote_callbacks_t
+@@ -18,3 +19,8 @@ struct native_ote_callbacks_t
+ 
+ // Call once after Ethernet is initialized. Callbacks run on the HTTP server task.
+ esp_err_t native_ote_start(esp_netif_t *netif, const native_ote_callbacks_t &callbacks);
++
++// Returns true if the request carries "Authorization: Bearer <OTEPassword>"
++// (compared in constant time). Returns false when the OTE password is not set
++// (empty string), i.e. OTE authentication is disabled.
++bool native_ote_is_authenticated(httpd_req_t *request);
+diff --git a/main/custom/serial_console.cpp b/main/custom/serial_console.cpp
+new file mode 100644
+index 0000000..867e5b1
+--- /dev/null
++++ b/main/custom/serial_console.cpp
+@@ -0,0 +1,159 @@
++// ESP32 Time Server - web status server: serial console tail
++// License: MIT
++// Website: https://github.com/SinclairKS/ESP32TimeServer
++//
++// See serial_console.h for the design notes.
++
++#include "ESP32TimeServerSettings.h"
++
++#if WEB_STATUS_SERVER_ENABLED && SERIAL_CONSOLE_ENABLED
++
++#include "serial_console.h"
++
++#include <atomic>
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++
++extern "C"
++{
++#include "esp_log.h"
++}
++
++namespace serial_console
++{
++namespace
++{
++
++// The ring buffer, addressed by monotonic byte index: logical byte n lives
++// at slot n & (kBufferBytes - 1). The writer and reader only exchange the
++// monotonic indices (atomics below); no per-byte locking is needed.
++alignas(64) static char s_buf[kBufferBytes];
++
++// Writer side: the log path. ESP-IDF invokes the vprintf callback with the
++// log lock held, so lines from all tasks arrive one at a time.
++static std::atomic<uint64_t> s_write_idx{0};
++
++// Reader side: the single httpd task (see web_status.cpp for why the
++// handlers are serial).
++static std::atomic<uint64_t> s_read_idx{0};
++static uint64_t s_total_dropped = 0; // updated only by the reader
++
++// Per-line scratch for the capture pass. Single writer (log lock held),
++// so a single static buffer is safe.
++constexpr size_t kMaxLineBytes = 1024;
++static char s_line[kMaxLineBytes];
++
++// Append one formatted line to the ring. Writer only (log lock held).
++void write_bytes(const char *data, size_t len)
++{
++    const uint64_t base = s_write_idx.load(std::memory_order_relaxed);
++    for (size_t i = 0; i < len; ++i)
++        s_buf[(base + i) & (kBufferBytes - 1)] = data[i];
++    s_write_idx.store(base + len, std::memory_order_release);
++}
++
++// The tee: capture the line, then forward it to the real console.
++int tee_vprintf(const char *format, va_list args)
++{
++    // Capture pass (vsnprintf consumes its va_list, so work on a copy).
++    va_list capture;
++    va_copy(capture, args);
++    const int n = vsnprintf(s_line, kMaxLineBytes, format, capture);
++    va_end(capture);
++    if (n > 0)
++    {
++        const size_t len =
++            (n < static_cast<int>(kMaxLineBytes))
++                ? static_cast<size_t>(n)
++                : kMaxLineBytes - 1; // over-long line: drop the tail
++        write_bytes(s_line, len);
++    }
++
++    // Console pass: when no custom vprintf is installed (this project
++    // installs none), ESP-IDF's default sink is the C library vprintf,
++    // which writes to the console UART. Forwarding there keeps the serial
++    // output byte-for-byte unchanged.
++    return vprintf(format, args);
++}
++
++} // namespace
++
++void init()
++{
++    esp_log_set_vprintf(tee_vprintf);
++}
++
++drain_result_t drain(uint64_t since_seq, char *buf, size_t cap)
++{
++    drain_result_t r;
++    if (cap == 0)
++        return r;
++
++    const uint64_t head = s_write_idx.load(std::memory_order_acquire);
++
++    uint64_t start;
++    if (since_seq == 0)
++    {
++        // First poll: the tail.
++        start = (head > cap) ? head - cap : 0;
++    }
++    else
++    {
++        start = since_seq;
++        if (start > head)
++            start = head; // clock skew / stale cursor: nothing new
++        const uint64_t available = head - start;
++        if (available > kBufferBytes)
++        {
++            // Part of the requested data was overwritten by newer data.
++            r.dropped = available - kBufferBytes;
++            s_total_dropped += r.dropped;
++            start = head - kBufferBytes;
++        }
++    }
++
++    uint64_t avail = head - start;
++    if (avail > cap)
++        avail = cap;
++
++    // Copy in at most two chunks (the buffer can wrap once inside the range).
++    size_t copied = 0;
++    uint64_t pos = start;
++    while (copied < avail)
++    {
++        const uint64_t slot = pos & (kBufferBytes - 1);
++        size_t chunk = kBufferBytes - slot; // contiguous run to the end of the ring
++        if (chunk > avail - copied)
++            chunk = static_cast<size_t>(avail - copied);
++        std::memcpy(buf + copied, s_buf + slot, chunk);
++        copied += chunk;
++        pos += chunk;
++    }
++
++    r.bytes = copied;
++    r.new_seq = start + copied;
++
++    // Callers send r.bytes explicitly, so a NUL terminator is only a
++    // convenience - and only when there is room for it (a full-cap read
++    // would otherwise write one byte past the end of the buffer).
++    if (copied < cap)
++        buf[copied] = '\0';
++
++    s_read_idx.store(r.new_seq, std::memory_order_release); // informational only
++    return r;
++}
++
++uint64_t seq()
++{
++    return s_write_idx.load(std::memory_order_acquire);
++}
++
++uint64_t dropped_bytes()
++{
++    return s_total_dropped;
++}
++
++} // namespace serial_console
++
++#endif
+diff --git a/main/custom/serial_console.h b/main/custom/serial_console.h
+new file mode 100644
+index 0000000..9354212
+--- /dev/null
++++ b/main/custom/serial_console.h
+@@ -0,0 +1,70 @@
++// ESP32 Time Server - web status server: serial console tail
++// License: MIT
++// Website: https://github.com/SinclairKS/ESP32TimeServer
++//
++// Captures the application serial console (ESP_LOG output) in a small
++// lock-free ring buffer so a live tail of it can be shown on the web
++// status page for debugging.
++//
++// How it works: ESP-IDF routes every ESP_LOG line through a single vprintf
++// callback. init() installs a tee that first forwards each formatted line
++// unchanged to the C library vprintf (ESP-IDF's default console sink, which
++// writes to the console UART) and then appends it to the ring buffer. The
++// buffer is drained by the web status httpd task.
++//
++// What it captures: everything logged after init() returns - in practice the
++// whole application console. ROM/bootloader output (before app_main) is not
++// visible, and lines compiled out (e.g. DEBUG_ENABLED 0) never appear.
++//
++// Threading: one writer - ESP-IDF holds the log lock around the vprintf
++// call, so lines from all tasks arrive serialized; one reader - the single
++// esp_http_server task services all request handlers serially. No locks are
++// needed; the only shared state is the two monotonic indices (atomics).
++//
++// Cost: one 16 KB static buffer in internal RAM, one vsnprintf per log line
++// on the log path, and one memcpy into the ring per line.
++
++#pragma once
++
++#include "ESP32TimeServerSettings.h"
++
++#if WEB_STATUS_SERVER_ENABLED && SERIAL_CONSOLE_ENABLED
++
++#include <cstddef>
++#include <cstdint>
++
++namespace serial_console
++{
++
++// Ring buffer capacity in bytes (power of two).
++constexpr size_t kBufferBytes = 16384;
++
++// Install the vprintf tee. Call once, as early as possible - the first
++// statement of app_main - so as little of the console as possible is lost.
++void init();
++
++// A slice of the ring buffer for the web status page.
++struct drain_result_t
++{
++    uint64_t new_seq = 0; // sequence number one past the last byte returned;
++                          // pass it back as the next since_seq
++    size_t bytes = 0;     // bytes copied into buf
++    uint64_t dropped = 0; // bytes lost to buffer wrap between since_seq and
++                          // the data actually returned (0 = no gap)
++};
++
++// Return up to `cap` bytes of console text logged at or after `since_seq`.
++// Since 0 means "give me the tail". If some of the requested data was
++// already overwritten, the oldest still-available bytes are returned and
++// `dropped` reports the gap. The buffer is NUL-terminated when non-empty.
++drain_result_t drain(uint64_t since_seq, char *buf, size_t cap);
++
++// Sequence number one past the last byte written (0 = empty).
++uint64_t seq();
++
++// Total bytes lost to buffer wrap, cumulative since boot.
++uint64_t dropped_bytes();
++
++} // namespace serial_console
++
++#endif
 diff --git a/main/custom/web_status.cpp b/main/custom/web_status.cpp
 new file mode 100644
-index 0000000..00c731a
+index 0000000..c0fe015
 --- /dev/null
 +++ b/main/custom/web_status.cpp
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,479 @@
 +// ESP32 Time Server - web status server
 +// License: MIT
 +// Website: https://github.com/SinclairKS/ESP32TimeServer
 +//
-+// Read-only web status server.
++// Web status server.
 +//
-+// This is a *small* auxiliary server whose only job is to expose the
-+// system status information (time, sync/PPS state, NTP and GNSS counters,
-+// memory) as a human readable page and as JSON, for monitoring purposes.
++// This is a *small* auxiliary server whose main job is to expose the system
++// status information (time, sync/PPS state, NTP and GNSS counters, memory)
++// as a human readable page and as JSON, for monitoring purposes. It also
++// exposes one privileged action: an authenticated reboot.
 +//
 +// Design constraints (important for a Stratum 1 time server):
 +//
-+// 1. It is read-only. It never touches the PPS discipline path, the GNSS
-+//    processing, or the NTP reply path - it only reads atomics / snapshots
-+//    that are already maintained for MQTT reporting.
++// 1. It is read-only, with one exception: POST /reboot, which is gated by
++//    the OTE password (the same Bearer check the OTE upload endpoint uses).
++//    It never touches the PPS discipline path, the GNSS processing, or the
++//    NTP reply path - it only reads atomics / snapshots that are already
++//    maintained for MQTT reporting.
 +//
 +// 2. It runs on FreeRTOS core 0 at a low priority (below every time
 +//    sensitive task) so that occasional HTML/JSON rendering can never
@@ -94,15 +435,29 @@ index 0000000..00c731a
 +#include "web_status.h"
 +
 +#include <cstdio>
++#include <cstdlib>
 +#include <cstdint>
++#include <cstring>
 +
 +extern "C"
 +{
++#include "arpa/inet.h"
 +#include "esp_heap_caps.h"
 +#include "esp_http_server.h"
 +#include "esp_log.h"
 +#include "esp_system.h"
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "lwip/sockets.h"
++#include "netinet/in.h"
++#include "sys/socket.h"
 +}
++
++#if SERIAL_CONSOLE_ENABLED
++#include "serial_console.h"
++#endif
++
++#include "native_ote.h"
 +
 +static const char *TAG = "web_status";
 +
@@ -124,6 +479,40 @@ index 0000000..00c731a
 +// single-task, serial-dispatch model above is what makes it safe.)
 +static char s_web_status_response[WEB_STATUS_RESPONSE_SIZE] = "";
 +
++#if SERIAL_CONSOLE_ENABLED
++// Reused for every /console response. Same single-task safety argument as
++// s_web_status_response above.
++static constexpr size_t CONSOLE_MAX_RESPONSE_BYTES = 4096;
++static char s_console_buffer[CONSOLE_MAX_RESPONSE_BYTES];
++
++// Tail of the serial console since the cursor the page last reported. The
++// text goes in the body; the sequence number (and any wrap gap) go in
++// headers, so no JSON escaping is needed for raw console text.
++static esp_err_t web_status_console_handler(httpd_req_t *req)
++{
++    char query[32] = "";
++    httpd_req_get_url_query_str(req, query, sizeof(query));
++    uint64_t since = 0;
++    if (std::strncmp(query, "since=", 6) == 0)
++        since = strtoull(query + 6, nullptr, 10);
++
++    const serial_console::drain_result_t r =
++        serial_console::drain(since, s_console_buffer, sizeof(s_console_buffer));
++
++    char num[24];
++    snprintf(num, sizeof(num), "%llu", static_cast<unsigned long long>(r.new_seq));
++    httpd_resp_set_hdr(req, "X-Console-Seq", num);
++    if (r.dropped > 0)
++    {
++        snprintf(num, sizeof(num), "%llu", static_cast<unsigned long long>(r.dropped));
++        httpd_resp_set_hdr(req, "X-Console-Dropped", num);
++    }
++    httpd_resp_set_type(req, "text/plain; charset=utf-8");
++    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++    return httpd_resp_send(req, s_console_buffer, static_cast<int>(r.bytes));
++}
++#endif // SERIAL_CONSOLE_ENABLED
++
 +// Filled in by main.cpp from its private status state (atomics / snapshots)
 +
 +void web_status_fill_snapshot(web_status_snapshot_t *s);
@@ -137,8 +526,8 @@ index 0000000..00c731a
 +    size_t size = WEB_STATUS_RESPONSE_SIZE;
 +    size_t len = 0;
 +
-+    len += static_cast<size_t>(snprintf(buf + len, size - len,
-+                                        "{\"app\":\"%s\","
++    const int written = snprintf(buf + len, size - len,
++                                 "{\"app\":\"%s\","
 +                                        "\"version\":\"%s\","
 +                                        "\"git_sha\":\"%s\","
 +                                        "\"build_date\":\"%s %s\","
@@ -202,10 +591,17 @@ index 0000000..00c731a
 +                                        static_cast<unsigned int>(s.psram_free_bytes),
 +                                        s.has_psram ? "true" : "false",
 +                                        s.ethernet_connected ? "true" : "false",
-+                                        s.ip));
++                                        s.ip);
 +
 +    httpd_resp_set_type(req, "application/json; charset=utf-8");
 +    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
++
++    // snprintf reports the length that WOULD have been written had the
++    // buffer been large enough - never send more than what actually fit.
++    if (written < 0 || static_cast<size_t>(written) >= size - len)
++        return httpd_resp_send(req, "{\"error\":\"status response truncated\"}\n", HTTPD_RESP_USE_STRLEN);
++
++    len += static_cast<size_t>(written);
 +    return httpd_resp_send(req, buf, static_cast<int>(len));
 +}
 +
@@ -231,6 +627,8 @@ index 0000000..00c731a
 +    ".up{text-align:right}"
 +    ".up .k{color:#8b98a5;font-size:11px;text-transform:uppercase;letter-spacing:.04em}"
 +    ".up .v{font-size:16px}"
++    ".up button{margin-top:10px;background:none;border:1px solid #f0616d66;color:#f0616d;border-radius:4px;padding:3px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;cursor:pointer}"
++    ".up button:hover{background:#f0616d1a}"
 +    ".pills{display:flex;flex-wrap:wrap;gap:8px;padding:12px 0;border-bottom:1px solid #2a3340}"
 +    ".pill{display:inline-flex;align-items:center;gap:6px;border:1px solid #2a3340;border-radius:999px;padding:3px 12px;font-size:12px;font-variant-numeric:tabular-nums}"
 +    ".pill.ok{color:#39d98a;border-color:#39d98a66}"
@@ -244,11 +642,18 @@ index 0000000..00c731a
 +    ".v{font-size:14px;font-variant-numeric:tabular-nums;text-align:right}"
 +    ".ok{color:#39d98a}.warn{color:#f5c542}.bad{color:#f0616d}.off{color:#8b98a5}"
 +    "footer{margin-top:16px;color:#8b98a5;font-size:.8em}"
++    ".console{margin-top:18px}"
++    ".console summary{cursor:pointer;font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#8b98a5;font-weight:600;padding:4px 0}"
++    "#console-box{margin-top:8px;background:#0a0e12;border:1px solid #2a3340;border-radius:6px;padding:10px;height:280px;overflow-y:auto;font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:#b8c4d0}"
++    ".console-ctl{display:flex;gap:8px;margin-top:6px;align-items:center}"
++    ".console-ctl button{background:none;border:1px solid #2a3340;color:#8b98a5;border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer}"
++    ".console-ctl button:hover{color:#dfe7ee}"
++    "#console-drop{color:#f5c542;font-size:11px}"
 +    "</style></head><body>"
 +    "<div class=\"wrap\">"
 +    "<div class=\"hero\">"
 +    "<div><div class=\"time\" id=\"clock\">--:--:--</div><div class=\"date\" id=\"date\"></div></div>"
-+    "<div class=\"up\"><div class=\"k\">uptime</div><div class=\"v\" id=\"uptime\">-</div></div>"
++    "<div class=\"up\"><div class=\"k\">uptime</div><div class=\"v\" id=\"uptime\">-</div><button id=\"reboot\" type=\"button\">reboot</button></div>"
 +    "</div>"
 +    "<div class=\"pills\" id=\"pills\"></div>"
 +    "<div class=\"cols\">"
@@ -256,6 +661,15 @@ index 0000000..00c731a
 +    "<div><div class=\"sec\">NTP</div><div id=\"col_ntp\"></div></div>"
 +    "<div><div class=\"sec\">System</div><div id=\"col_sys\"></div></div>"
 +    "</div>"
++    "<details class=\"console\">"
++    "<summary>Console (live serial log)</summary>"
++    "<div id=\"console-box\"></div>"
++    "<div class=\"console-ctl\">"
++    "<button id=\"console-pause\" type=\"button\">pause</button>"
++    "<button id=\"console-clear\" type=\"button\">clear</button>"
++    "<span id=\"console-drop\"></span>"
++    "</div>"
++    "</details>"
 +    "<footer id=\"foot\">loading...</footer>"
 +    "</div>"
 +    "<script>"
@@ -277,7 +691,7 @@ index 0000000..00c731a
 +    "var since=s.last_successful_sync_us>0?Math.floor(s.uptime_seconds-s.last_successful_sync_us/1e6):0;"
 +    "document.getElementById('pills').innerHTML="
 +    "(s.stratum_one?pill('Stratum 1','ok'):pill('Stratum '+(s.stratum==16?'init':s.stratum),'warn'))+"
-+    "pill(s.reference_id)+"
++    "pill(s.reference_id,s.reference_id==='INIT'?'':(s.holdover?'warn':'ok'))+"
 +    "(s.pps_active?pill('PPS ok','ok'):pill('PPS off'))+"
 +    "(s.satellites>0?pill(s.satellites+' sats','ok'):pill('0 sats'))+"
 +    "(s.ethernet_connected?pill('eth up','ok'):pill('eth down','bad'))+"
@@ -312,6 +726,14 @@ index 0000000..00c731a
 +    "}catch(e){document.getElementById('foot').textContent='status unavailable: '+e}"
 +    "}"
 +    "refresh();setInterval(refresh,2000);"
++    "var cseq=0,cpaused=false,clines=[];"
++    "function cadd(t){if(!t)return;var p=t.split('\\n');for(var i=0;i<p.length;i++){if(p[i].length){clines.push(p[i]);if(clines.length>400)clines.splice(0,clines.length-400);}}}"
++    "function crender(){var b=document.getElementById('console-box');var stick=b.scrollHeight-b.scrollTop-b.clientHeight<30;b.innerHTML=clines.map(function(l){return l.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}).join('\\n');if(stick)b.scrollTop=b.scrollHeight;}"
++    "async function cpoll(){if(!cpaused){try{var r=await fetch('/console?since='+cseq);var ns=r.headers.get('X-Console-Seq');cseq=ns?parseInt(ns,10):0;var d=r.headers.get('X-Console-Dropped');document.getElementById('console-drop').textContent=d?('dropped '+d+' bytes (buffer full)'):'';cadd((await r.text()).replace(/\\u001b\\[[0-9;]*m/g,''));crender();}catch(e){}}setTimeout(cpoll,2000);}"
++    "document.getElementById('console-pause').onclick=function(){cpaused=!cpaused;this.textContent=cpaused?'resume':'pause';};"
++    "document.getElementById('console-clear').onclick=function(){clines.length=0;crender();};"
++    "document.getElementById('reboot').onclick=function(){var pw=prompt('Reboot the ESP32? Enter the OTE password:');if(pw===null)return;fetch('/reboot',{method:'POST',headers:{'Authorization':'Bearer '+pw}}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t||String(r.status));return t;});}).then(function(){document.getElementById('foot').textContent='rebooting...';}).catch(function(e){alert('reboot failed: '+e);});};"
++    "cpoll();"
 +    "</script></body></html>";
 +
 +static esp_err_t web_status_index_handler(httpd_req_t *req)
@@ -320,6 +742,84 @@ index 0000000..00c731a
 +    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 +    return httpd_resp_send(req, WEB_STATUS_HTML, HTTPD_RESP_USE_STRLEN);
 +}
++
++#if OTE_UPDATES_ENABLED
++// Format a request's client address as text ("a.b.c.d" or IPv6) and report
++// its port. IDF v6.1's httpd_req_t no longer carries the peer address; the
++// session socket is exposed via httpd_req_to_sockfd() and getpeername()
++// reports both the address family and the port. On failure buf gets
++// "unknown" and the port stays 0.
++static void web_status_client_ip(httpd_req_t *req, char *buf, size_t cap, uint16_t *port_out)
++{
++    if (port_out != nullptr)
++        *port_out = 0;
++    if (req == nullptr)
++    {
++        std::snprintf(buf, cap, "unknown");
++        return;
++    }
++    int fd = httpd_req_to_sockfd(req);
++    if (fd < 0)
++    {
++        std::snprintf(buf, cap, "unknown");
++        return;
++    }
++    struct sockaddr_storage peer{};
++    socklen_t peer_len = sizeof(peer);
++    if (getpeername(fd, reinterpret_cast<struct sockaddr *>(&peer), &peer_len) != 0)
++    {
++        std::snprintf(buf, cap, "unknown");
++        return;
++    }
++    if (peer.ss_family == AF_INET)
++    {
++        const struct sockaddr_in *v4 = reinterpret_cast<const struct sockaddr_in *>(&peer);
++        (void)inet_ntop(AF_INET, &v4->sin_addr, buf, static_cast<socklen_t>(cap));
++        if (port_out != nullptr)
++            *port_out = ntohs(v4->sin_port);
++    }
++    else if (peer.ss_family == AF_INET6)
++    {
++        const struct sockaddr_in6 *v6 = reinterpret_cast<const struct sockaddr_in6 *>(&peer);
++        (void)inet_ntop(AF_INET6, &v6->sin6_addr, buf, static_cast<socklen_t>(cap));
++        if (port_out != nullptr)
++            *port_out = ntohs(v6->sin6_port);
++    }
++    else
++    {
++        std::snprintf(buf, cap, "unknown");
++    }
++}
++
++// POST /reboot — reboots the device. Gated by the OTE password via the same
++// Bearer check the OTE upload endpoint uses, so no new credential exists.
++// The response is sent before the reset so the client sees "rebooting"
++// rather than a connection drop.
++static esp_err_t web_status_reboot_handler(httpd_req_t *req)
++{
++    char client_ip[INET6_ADDRSTRLEN] = "?";
++    uint16_t client_port = 0;
++    web_status_client_ip(req, client_ip, sizeof(client_ip), &client_port);
++
++    if (!native_ote_is_authenticated(req))
++    {
++        ESP_LOGW(TAG, "Reboot denied: missing or wrong OTE password (from %s:%u)",
++                 client_ip, static_cast<unsigned int>(client_port));
++        httpd_resp_set_status(req, "401 Unauthorized");
++        httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
++        httpd_resp_set_type(req, "text/plain; charset=utf-8");
++        return httpd_resp_send(req, "reboot requires the OTE password\n", HTTPD_RESP_USE_STRLEN);
++    }
++
++    ESP_LOGW(TAG, "Reboot requested via web status page by %s:%u",
++             client_ip, static_cast<unsigned int>(client_port));
++    httpd_resp_set_type(req, "text/plain; charset=utf-8");
++    httpd_resp_send(req, "rebooting\n", HTTPD_RESP_USE_STRLEN);
++    vTaskDelay(pdMS_TO_TICKS(100)); // let the response out the door first
++    esp_restart();
++    return ESP_FAIL; // unreachable
++}
++#endif
 +
 +void web_server_init()
 +{
@@ -354,6 +854,22 @@ index 0000000..00c731a
 +    status_uri.method = HTTP_GET;
 +    status_uri.handler = web_status_json_handler;
 +    httpd_register_uri_handler(s_web_server, &status_uri);
++
++#if SERIAL_CONSOLE_ENABLED
++    httpd_uri_t console_uri{};
++    console_uri.uri = "/console";
++    console_uri.method = HTTP_GET;
++    console_uri.handler = web_status_console_handler;
++    httpd_register_uri_handler(s_web_server, &console_uri);
++#endif
++
++#if OTE_UPDATES_ENABLED
++    httpd_uri_t reboot_uri{};
++    reboot_uri.uri = "/reboot";
++    reboot_uri.method = HTTP_POST;
++    reboot_uri.handler = web_status_reboot_handler;
++    httpd_register_uri_handler(s_web_server, &reboot_uri);
++#endif
 +
 +    ESP_LOGI(TAG, "Web status server listening on port %u (core %d, priority %u)",
 +             WebStatusPort,
@@ -440,20 +956,23 @@ index 0000000..8e120d1
 +
 +#endif
 diff --git a/main/main.cpp b/main/main.cpp
-index 542f0c7..b4b3e94 100644
+index 542f0c7..1ed39c1 100644
 --- a/main/main.cpp
 +++ b/main/main.cpp
-@@ -61,6 +61,9 @@
+@@ -61,6 +61,12 @@
  #include "custom/gnss_receiver.h"
  #include "custom/gnss_uart.h"
  #include "custom/app_metadata.h"
 +#if WEB_STATUS_SERVER_ENABLED
 +#include "custom/web_status.h"
 +#endif
++#if WEB_STATUS_SERVER_ENABLED && SERIAL_CONSOLE_ENABLED
++#include "custom/serial_console.h"
++#endif
  #include "custom/determine_stack_sizes.h"
  #include "custom/health_check.h"
  #include "custom/leap_seconds.h"
-@@ -117,7 +120,7 @@ extern "C"
+@@ -117,7 +123,7 @@ extern "C"
  #include "ff.h"
  #endif
  #include "esp_mac.h"
@@ -462,7 +981,7 @@ index 542f0c7..b4b3e94 100644
  #include "esp_heap_caps.h"
  #endif
  #if MQTT_ENABLED
-@@ -2425,6 +2428,67 @@ static void build_ntp_reply(const uint8_t *request, uint8_t *reply, uint8_t vers
+@@ -2425,6 +2431,67 @@ static void build_ntp_reply(const uint8_t *request, uint8_t *reply, uint8_t vers
  
  #endif
  
@@ -530,7 +1049,7 @@ index 542f0c7..b4b3e94 100644
  static constexpr size_t ETH_HEADER_SIZE = 14;
  static constexpr size_t IPV4_HEADER_SIZE = 20;
  static constexpr size_t IPV6_HEADER_SIZE = 40;
-@@ -7365,6 +7429,291 @@ static void setup_gnss()
+@@ -7365,6 +7432,291 @@ static void setup_gnss()
               begin_result == gnss::Status::ok ? "success" : "failed");
  #endif
  
@@ -822,7 +1341,17 @@ index 542f0c7..b4b3e94 100644
  #endif
  
  #if DEBUG_ENABLED
-@@ -11674,6 +12023,10 @@ extern "C" void app_main()
+@@ -11636,6 +11988,9 @@ static void validate_board_configuration()
+ 
+ extern "C" void app_main()
+ {
++#if WEB_STATUS_SERVER_ENABLED && SERIAL_CONSOLE_ENABLED
++    serial_console::init(); // tee the serial console as early as possible so the web status page can show a live tail
++#endif
+ 
+     check_NTP_and_PTP_settings();
+ 
+@@ -11674,6 +12029,10 @@ extern "C" void app_main()
  
      setup_for_ote_updates();
  

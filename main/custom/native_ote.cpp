@@ -57,28 +57,31 @@ namespace
         ESP_LOGE(TAG, "%s (%s)", reason, esp_err_to_name(error));
         return send_response(request, status, reason);
     }
+} // namespace
 
+bool native_ote_is_authenticated(httpd_req_t *request)
+{
+    char authorization[sizeof(OTEPassword) + 7]{};
+    const size_t password_length = strlen(OTEPassword);
+    if (password_length == 0 ||
+        httpd_req_get_hdr_value_len(request, "Authorization") != password_length + 7 ||
+        httpd_req_get_hdr_value_str(request, "Authorization", authorization, sizeof(authorization)) != ESP_OK ||
+        memcmp(authorization, "Bearer ", 7) != 0)
+        return false;
+
+    unsigned int difference = 0;
+    for (size_t index = 0; index < password_length; ++index)
+        difference |= static_cast<unsigned char>(authorization[index + 7]) ^
+                      static_cast<unsigned char>(OTEPassword[index]);
+    return difference == 0;
+}
+
+namespace
+{
     static void report_progress(size_t written, size_t total)
     {
         if (s_callbacks.progress != nullptr)
             s_callbacks.progress(static_cast<unsigned int>(written), static_cast<unsigned int>(total));
-    }
-
-    static bool is_authenticated(httpd_req_t *request)
-    {
-        char authorization[sizeof(OTEPassword) + 7]{};
-        const size_t password_length = strlen(OTEPassword);
-        if (password_length == 0 ||
-            httpd_req_get_hdr_value_len(request, "Authorization") != password_length + 7 ||
-            httpd_req_get_hdr_value_str(request, "Authorization", authorization, sizeof(authorization)) != ESP_OK ||
-            memcmp(authorization, "Bearer ", 7) != 0)
-            return false;
-
-        unsigned int difference = 0;
-        for (size_t index = 0; index < password_length; ++index)
-            difference |= static_cast<unsigned char>(authorization[index + 7]) ^
-                          static_cast<unsigned char>(OTEPassword[index]);
-        return difference == 0;
     }
 
     static bool has_valid_content_length(httpd_req_t *request)
@@ -141,7 +144,7 @@ namespace
 
     static esp_err_t upload_handler(httpd_req_t *request)
     {
-        if (!is_authenticated(request))
+        if (!native_ote_is_authenticated(request))
         {
             httpd_resp_set_hdr(request, "WWW-Authenticate", "Bearer");
             return send_response(request, "401 Unauthorized", "OTE authentication required\n");
