@@ -140,6 +140,14 @@ static constexpr uint16_t OTEPort = 3232;
 static constexpr unsigned int OTEReceiveTimeoutSeconds = 15;
 static constexpr unsigned int OTEMaxUploadTimeSeconds = 300;
 
+// (optional) read-only web status server support
+// When enabled a small http server is started (pinned to FreeRTOS core 0, low priority)
+// that serves a status dashboard at http://<ip>/ and machine readable JSON at
+// http://<ip>/status. It is read-only: it only displays status that is already
+// reported elsewhere and does not affect NTP, GNSS or PPS processing.
+#define WEB_STATUS_SERVER_ENABLED 1 // 0 = Disabled; 1 = Enabled
+static constexpr uint16_t WebStatusPort = 80;
+
 // (Optional) MQTT reporting support
 // MQTT_ENABLED provides for current system status and activity reporting on information such as:
 // uptime, number of active satellites, ntp request counts, etc.
@@ -255,11 +263,11 @@ static constexpr const char *timeZoneSpec = "EST5EDT,M3.2.0/2,M11.1.0/2";
 // 3. The GNSS GND must be connected to the ESP32 GND                                                     *
 // ********************************************************************************************************
 
-#define UBLOX_COMPLIANT_GNSS_RECEIVER_ENABLED 1 // 0 = Disabled; 1 = Enabled
+#define UBLOX_COMPLIANT_GNSS_RECEIVER_ENABLED 0 // 0 = Disabled; 1 = Enabled
 
 // The following only needs to be set if your receiver does not use a U-Blox or U-Block clone GNSS chip
 
-static constexpr uint32_t baudRateForUbloxNonCompliantGNSSReceiver = 115200;
+static constexpr uint32_t baudRateForUbloxNonCompliantGNSSReceiver = 9600;
 
 // Unless you know what you are doing, the options below should be left as is
 

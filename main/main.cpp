@@ -61,6 +61,9 @@
 #include "custom/gnss_receiver.h"
 #include "custom/gnss_uart.h"
 #include "custom/app_metadata.h"
+#if WEB_STATUS_SERVER_ENABLED
+#include "custom/web_status.h"
+#endif
 #include "custom/determine_stack_sizes.h"
 #include "custom/health_check.h"
 #include "custom/leap_seconds.h"
@@ -117,7 +120,7 @@ extern "C"
 #include "ff.h"
 #endif
 #include "esp_mac.h"
-#if MQTT_ENABLED || (CONFIG_SPIRAM && !CONFIG_SPIRAM_BOOT_INIT)
+#if MQTT_ENABLED || WEB_STATUS_SERVER_ENABLED || (CONFIG_SPIRAM && !CONFIG_SPIRAM_BOOT_INIT)
 #include "esp_heap_caps.h"
 #endif
 #if MQTT_ENABLED
@@ -2424,6 +2427,67 @@ static void build_ntp_reply(const uint8_t *request, uint8_t *reply, uint8_t vers
 }
 
 #endif
+
+#if WEB_STATUS_SERVER_ENABLED
+// Fills in the read-only status snapshot for the web status server (see
+// custom/web_status.h). It only reads atomics and the same snapshots that
+// are already maintained for MQTT reporting, so it has no effect on the
+// time critical processing.
+//
+// (Must appear after ntp_reply_status_t / get_ntp_reply_status() are
+// defined, since it returns one of the former by value.)
+void web_status_fill_snapshot(web_status_snapshot_t *s)
+{
+    if (s == nullptr)
+        return;
+
+    // Upstream 4.0.X keeps the system wall clock in continuous TAI (see the s_leap_state
+    // comment); the page must show UTC, the same scale the NTP replies carry, so run the
+    // standard TAI -> UTC conversion. Before the first GNSS fix the leap state is invalid
+    // (utc_now() == 0) and the raw clock is shown, which is not meaningful yet anyway.
+    const time_t utc = utc_now();
+    s->wall_clock = utc != 0 ? static_cast<int64_t>(utc) : static_cast<int64_t>(time(nullptr));
+    s->uptime_us = static_cast<uint64_t>(esp_timer_get_time());
+
+    const ntp_reply_status_t ntp_status = get_ntp_reply_status();
+    s->stratum = ntp_status.stratum;
+    s->stratum_one = ntp_status.stratum == 1;
+    memcpy(s->reference_id, ntp_status.reference_id, 4);
+    s->reference_id[4] = '\0';
+
+    const sync_state_t sync = get_sync_state_snapshot();
+    s->pps_active = sync.pps_active;
+    s->gnss_timing_valid = sync.gnss_timing_valid;
+    s->holdover = ntp_status.holdover;
+    s->pps_missing = sync.faults.pps_missing;
+    s->gnss_invalid = sync.faults.gnss_invalid;
+    s->sanity_mismatch = sync.faults.sanity_mismatch;
+    s->sync_stale = sync.faults.sync_stale;
+    s->last_successful_sync_us = sync.last_successful_sync_us;
+    s->last_sync_delta = sync.last_sync_delta_seconds;
+
+    s->ntp_requests_total = s_ntp_input_count.load(std::memory_order_relaxed);
+    s->load_shedding_recent = ntp_load_shedding_active();
+
+#if MQTT_ENABLED
+    s->satellites = s_satellite_count.load(std::memory_order_relaxed);
+    s->ntp_responses_total = s_ntp_responses.load(std::memory_order_relaxed);
+    s->ntp_responses_synced = s_ntp_responses_synchronized_and_disciplined.load(std::memory_order_relaxed);
+    s->ntp_responses_gnss_unsynced = s_ntp_responses_gnss_unsynchronized.load(std::memory_order_relaxed);
+    s->ntp_responses_pps_undisciplined = s_ntp_responses_pps_undisciplined.load(std::memory_order_relaxed);
+    s->ntp_peak_requests_per_second = s_ntp_most_requests_per_second.load(std::memory_order_relaxed);
+#endif
+
+    s->free_heap_bytes = static_cast<uint32_t>(esp_get_free_heap_size());
+    s->min_free_heap_bytes = static_cast<uint32_t>(esp_get_minimum_free_heap_size());
+    s->psram_free_bytes = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    s->has_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0;
+
+    s->ethernet_connected = s_ethernet_connected.load(std::memory_order_acquire);
+    snprintf(s->ip, sizeof(s->ip), "%s", s_ip_address);
+}
+#endif
+
 
 static constexpr size_t ETH_HEADER_SIZE = 14;
 static constexpr size_t IPV4_HEADER_SIZE = 20;
@@ -7365,6 +7429,291 @@ static void setup_gnss()
              begin_result == gnss::Status::ok ? "success" : "failed");
 #endif
 
+    // --- MTK3339 (Adafruit Ultimate GPS #746 / PA1616S) auto-configuration ---------
+    // Per the GlobalTop PMTK command datasheet (PMTK_A11), PMTK220 (update rate)
+    // and PMTK251 (baud rate) settings do NOT survive a power cycle on the MTK3339;
+    // the module always powers up at its factory 9600 baud / 1 Hz defaults.
+    // The commands below therefore have to be re-issued at every startup:
+    //   1. PMTK314 - output RMC once per fix and GSV once per 5 fixes, all other
+    //                NMEA sentences disabled (RMC = time source, GSV = satellite
+    //                count, everything else is just baud-rate overhead).
+    //   2. PMTK220 - 5 Hz navigation solution so a valid RMC is available every
+    //                ~200 ms instead of every second.
+    //   3. PMTK251 - NMEA port to 115200 baud (takes effect immediately).
+    // Faster RMC output keeps the per-iteration GNSS validity check (which waits
+    // for an RMC) short, and the higher baud rate minimizes serial latency.
+    {
+        static const char *mtk_commands[] = {
+            "$PMTK314,0,1,0,0,0,5,0,0,0,0,0,0,0,0,0,0,0,0,0*2C\r\n",
+            "$PMTK220,200*2C\r\n",
+        };
+        // NOTE: the frame reader below resets its buffer on the leading '$', so it
+        // holds only the NMEA body (no '$', no checksum) when it reaches '*'.
+        // These expected strings therefore omit the '$' and the '*xx' checksum.
+        static const char *mtk_expected_acks[] = {
+            "PMTK001,314,3",
+            "PMTK001,220,3",
+        };
+        static const char mtk_baud_command[] = "$PMTK251,115200*1F\r\n";
+        static constexpr uint32_t mtk_ack_command_count = 2;
+        static constexpr int64_t mtk_ack_timeout_us = 1500LL * 1000LL;
+        static constexpr int64_t mtk_baud_probe_timeout_us = 1500LL * 1000LL;
+
+        // Reads NMEA frames at the current UART rate. A frame only counts as
+        // "seen" when its NMEA checksum (the 2 hex digits after '*') matches the
+        // XOR of the body - this is what makes the rate probe robust: a stream
+        // read at the wrong baud rate decodes to garbage that essentially never
+        // yields a valid checksum, so it cannot be mistaken for the real rate.
+        // If 'expected' is non-null it returns true on an exact body match (which
+        // also requires a valid checksum); if 'expected' is null it is a plain
+        // probe and returns true once 'min_frames' valid-checksum frames are seen.
+        // Records how many valid frames were seen and the last body for logs.
+        auto mtk_wait_for_frame = [&](const char *expected, int64_t timeout_us, uint32_t min_frames, char *last_seen, uint32_t *frames_seen) -> bool
+        {
+            char frame[80];
+            size_t frame_len = 0;
+            char hex[2] = {0, 0};
+            size_t hex_len = 0;
+            uint8_t xor_sum = 0;
+            bool in_frame = false;
+            bool collecting_hex = false;
+            int64_t start_us = esp_timer_get_time();
+            *frames_seen = 0;
+            last_seen[0] = '\0';
+
+            auto process_frame = [&]() -> bool
+            {
+                frame[frame_len] = '\0';
+                uint8_t declared = 0;
+                bool have_checksum = false;
+                if (hex_len == 2)
+                {
+                    auto hexval = [](char c) -> int
+                    {
+                        if (c >= '0' && c <= '9')
+                            return c - '0';
+                        if (c >= 'A' && c <= 'F')
+                            return c - 'A' + 10;
+                        if (c >= 'a' && c <= 'f')
+                            return c - 'a' + 10;
+                        return -1;
+                    };
+                    int hi = hexval(hex[0]);
+                    int lo = hexval(hex[1]);
+                    if (hi >= 0 && lo >= 0)
+                    {
+                        declared = static_cast<uint8_t>((hi << 4) | lo);
+                        have_checksum = true;
+                    }
+                }
+                bool checksum_ok = have_checksum && frame_len > 0 && (declared == xor_sum);
+
+                if (checksum_ok)
+                {
+                    (*frames_seen)++;
+                    memcpy(last_seen, frame, frame_len + 1);
+                }
+                if (expected != nullptr)
+                    return checksum_ok && strcmp(frame, expected) == 0;
+                if (expected == nullptr && checksum_ok && (*frames_seen) >= min_frames)
+                    return true;
+                return false;
+            };
+
+            while ((esp_timer_get_time() - start_us) < timeout_us)
+            {
+                for (;;)
+                {
+                    uint8_t byte_value = 0;
+                    bool has_data = false;
+                    if (!read_gnss_uart_byte(&byte_value, &has_data) || !has_data)
+                        break;
+
+                    char ch = static_cast<char>(byte_value);
+                    if (ch == '$')
+                    {
+                        in_frame = true;
+                        collecting_hex = false;
+                        frame_len = 0;
+                        hex_len = 0;
+                        xor_sum = 0;
+                    }
+                    else if (!in_frame)
+                    {
+                        // ignore bytes outside a frame
+                    }
+                    else if (ch == '*')
+                    {
+                        collecting_hex = true;
+                        hex_len = 0;
+                    }
+                    else if (collecting_hex && hex_len < 2)
+                    {
+                        hex[hex_len++] = ch;
+                    }
+                    else if (ch == '\r' || ch == '\n')
+                    {
+                        if (process_frame())
+                            return true;
+                        in_frame = false;
+                        collecting_hex = false;
+                    }
+                    else
+                    {
+                        if (frame_len < sizeof(frame) - 1)
+                        {
+                            frame[frame_len++] = ch;
+                            xor_sum = static_cast<uint8_t>(xor_sum ^ static_cast<uint8_t>(ch));
+                        }
+                    }
+                }
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+
+            return false;
+        };
+
+        auto mtk_send = [](const char *command)
+        {
+            size_t bytes_written = 0;
+            gnss_uart_write(reinterpret_cast<const uint8_t *>(command),
+                            strlen(command), &bytes_written);
+        };
+
+        // Phase 0: discover the rate the module is actually transmitting at.
+        // Normally the factory 9600 baud, but per the PMTK datasheet note, if
+        // the module's backup power (VBACKUP / coin cell) is present the last
+        // configured rate survives a power cycle, so a 115200 from a previous
+        // boot may be retained.
+        static const uint32_t mtk_probe_bauds[] = {9600, 115200};
+        static constexpr int64_t mtk_probe_baud_timeout_us = 3500LL * 1000LL;
+        uint32_t current_baud = 0;
+        uint32_t probe_frames_at_9600 = 0;
+        uint32_t probe_frames_at_115200 = 0;
+        char mtk_last_frame[80];
+        if (begin_result == gnss::Status::ok)
+        {
+            // Fast path: the s_gnss.probe() call above already confirmed valid
+            // NMEA at 'baud' (the probe's documented success condition is
+            // receiving valid NMEA), so re-probing that same rate
+            // would only repeat the open/close cycle and wait out two more
+            // 1 Hz factory frames for no new information.
+            current_baud = baud;
+        }
+        else
+        {
+            for (uint32_t probe_baud : mtk_probe_bauds)
+            {
+                reopen_gnss_uart(probe_baud);
+                vTaskDelay(pdMS_TO_TICKS(100));
+
+                uint32_t probe_frames = 0;
+                if (mtk_wait_for_frame(nullptr, mtk_probe_baud_timeout_us, 2, mtk_last_frame, &probe_frames))
+                {
+                    current_baud = probe_baud;
+                    if (probe_baud == 9600)
+                        probe_frames_at_9600 = probe_frames;
+                    else
+                        probe_frames_at_115200 = probe_frames;
+                    break;
+                }
+            }
+        }
+
+        if (current_baud == 0)
+        {
+            // No NMEA at either rate - restore the configured rate for the rest
+            // of the firmware and skip configuration.
+            reopen_gnss_uart(baud);
+            ESP_LOGW(TAG,
+                     "MTK3339: no NMEA visible at 9600 (frames_seen=%lu) or 115200 (frames_seen=%lu); check power and TX/RX wiring.",
+                     static_cast<unsigned long>(probe_frames_at_9600),
+                     static_cast<unsigned long>(probe_frames_at_115200));
+            return;
+        }
+
+        // Drain everything the module has emitted (startup messages plus the
+        // frames seen during probing) before starting the command exchange.
+        for (;;)
+        {
+            uint8_t drain_byte = 0;
+            bool drain_has_data = false;
+            if (!read_gnss_uart_byte(&drain_byte, &drain_has_data) || !drain_has_data)
+                break;
+        }
+
+        bool mtk_config_ok = true;
+        uint32_t mtk_frames = 0;
+
+        // Phase 1 (at the module's current rate): set the NMEA output mask (RMC
+        // every fix, GSV every 5 fixes, everything else off) and the 5 Hz
+        // navigation rate. Both are acknowledged with PMTK001,xxx,3.
+        for (uint32_t m = 0; m < mtk_ack_command_count; m++)
+        {
+            mtk_send(mtk_commands[m]);
+            if (!mtk_wait_for_frame(mtk_expected_acks[m], mtk_ack_timeout_us, 1, mtk_last_frame, &mtk_frames))
+            {
+                mtk_config_ok = false;
+                ESP_LOGW(TAG,
+                         "MTK3339 configuration command %lu got no matching ack (frames_seen=%lu, last_frame='%s'); continuing without the remaining configuration.",
+                         static_cast<unsigned long>(m + 1),
+                         static_cast<unsigned long>(mtk_frames),
+                         mtk_last_frame);
+                break;
+            }
+        }
+
+        // Phase 2: move the NMEA port to 115200 baud. PMTK251 takes effect
+        // IMMEDIATELY - before the module emits its own ack - so the ack and all
+        // subsequent NMEA arrive at the new rate while we are still listening at
+        // 9600. The ack therefore cannot be relied upon; instead, switch the
+        // UART to 115200 and verify that the module is actually transmitting
+        // NMEA there.
+        if (mtk_config_ok)
+        {
+            mtk_send(mtk_baud_command);
+            vTaskDelay(pdMS_TO_TICKS(250)); // give the module time to apply the new rate
+            reopen_gnss_uart(115200);
+            vTaskDelay(pdMS_TO_TICKS(100));
+
+            uint32_t frames_at_new_baud = 0;
+            if (mtk_wait_for_frame(nullptr, mtk_baud_probe_timeout_us, 2, mtk_last_frame, &frames_at_new_baud))
+            {
+                s_gnss_target_baud = 115200;
+                s_detected_gnss_baud = 115200;
+            }
+            else
+            {
+                // Nothing visible at 115200 - probe at 9600 to see where the
+                // module actually is before giving up.
+                reopen_gnss_uart(9600);
+                vTaskDelay(pdMS_TO_TICKS(100));
+
+                if (mtk_wait_for_frame(nullptr, mtk_baud_probe_timeout_us, 1, mtk_last_frame, &mtk_frames))
+                {
+                    ESP_LOGW(TAG,
+                             "MTK3339 is still transmitting at 9600 after PMTK251 (frames_seen=%lu, last_frame='%s'); continuing at 9600.",
+                             static_cast<unsigned long>(mtk_frames),
+                             mtk_last_frame);
+                }
+                else
+                {
+                    mtk_config_ok = false;
+                    ESP_LOGW(TAG,
+                             "MTK3339: no NMEA visible at 115200 (frames_seen=%lu) nor at 9600 (frames_seen=%lu) after PMTK251; check wiring.",
+                             static_cast<unsigned long>(frames_at_new_baud),
+                             static_cast<unsigned long>(mtk_frames));
+                }
+            }
+        }
+
+        if (mtk_config_ok)
+            ESP_LOGI(TAG, "MTK3339 configured: 5 Hz RMC/GSV output at %lu baud.", static_cast<unsigned long>(s_detected_gnss_baud));
+        else
+            ESP_LOGW(TAG,
+                     "MTK3339 configuration incomplete; GNSS time will still be acquired at the module's current settings, but startup qualification may take longer.");
+    }
+
 #endif
 
 #if DEBUG_ENABLED
@@ -11673,6 +12022,10 @@ extern "C" void app_main()
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     setup_for_ote_updates();
+
+#if WEB_STATUS_SERVER_ENABLED
+    web_server_init();
+#endif
 
     setup_mqtt();
 

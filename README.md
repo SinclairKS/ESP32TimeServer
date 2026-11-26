@@ -45,6 +45,141 @@ to at [printables.com](https://www.printables.com/@RobLatour_54648/models)
 
 ---
 
+## Fork Changes
+
+> **Note on development:** the changes in this fork were developed with the
+> assistance of artificial intelligence (AI) technology. The AI produced the
+> code and documentation on request; a human reviewed the design decisions,
+> verified the build, and validated the result. The fork is provided as-is,
+> and none of these changes have been incorporated into the upstream project.
+
+This fork is built on version 4.0.0 (upstream commit `f117796`). It adds two
+features on top, together with a small number of supporting changes.
+Everything is opt-in through `main/ESP32TimeServerSettings.h`, so the fork
+compiles identically to upstream when the new options are left disabled.
+
+### GNSS: MTK3339 support (Adafruit Ultimate GPS #746)
+
+Upstream is written around the u-blox MAX-M10S (via the SparkFun u-blox
+library). This fork adds first-class support for the **MTK3339** receiver
+(Adafruit Ultimate GPS #746 / PA1616S), which is driven over plain NMEA on the
+same GPIO 20/21/22 wiring as the u-blox path.
+
+- **Auto-configuration at every boot.** The MTK3339 does not retain the update
+  rate (`PMTK220`) or the NMEA port baud rate (`PMTK251`) across a power cycle
+  (its VBACKUP pin is unpopulated), so it always powers up at the factory
+  9600 baud / 1 Hz defaults. At startup the firmware therefore re-issues a short
+  PMTK sequence:
+  - `PMTK314` — emit **RMC** once per fix and **GSV** once every 5 fixes, and
+    silence every other sentence (RMC is the time source, GSV is used only for
+    the satellite count, and the rest is serial overhead).
+  - `PMTK220` — a 5 Hz navigation solution, so a valid RMC is available every
+    ~200 ms instead of every second.
+  - `PMTK251` — move the NMEA port to 115200 baud (applies immediately).
+- **Baud-rate discovery.** Before sending anything the firmware detects the
+  rate the module is actually transmitting at by scanning 9600 and 115200 and
+  counting frames whose NMEA checksum validates (garbage read at the wrong rate
+  essentially never produces a valid checksum). A fast path seeds this from the
+  rate the receiver was already confirmed on, which trims a couple of seconds
+  off an otherwise clean boot.
+- **Checksum-validated acknowledgements.** Each configuration command is only
+  accepted when its `PMTK001,xxx,3` acknowledgement arrives *and* its NMEA
+  checksum is valid, so a partially-answered configuration is logged and the
+  module is left in a safe, known state rather than assumed to be set up.
+
+This path is compiled only when `UBLOX_COMPLIANT_GNSS_RECEIVER_ENABLED` is `0`,
+so it cannot affect a u-blox build.
+
+### Web status server
+
+A small, **read-only** HTTP status server is added. It exposes the same state
+the firmware already maintains for MQTT reporting — it never touches the PPS
+discipline path, the GNSS processing, or the NTP reply path.
+
+- **Endpoints**
+  - `GET /` — a single-page "command deck" dashboard (a live clock, an uptime
+    figure, a row of health pills, and Timing / NTP / System columns) that
+    polls `/status` every two seconds. No external assets, so it works with no
+    internet access.
+  - `GET /status` — the same data as JSON.
+- **Clock** — the dashboard's live clock and the `epoch` field report **UTC**,
+  the same scale the NTP server hands to clients, so the page matches
+  https://time.is. Upstream 4.0.X keeps the system wall clock in continuous
+  TAI (it is only converted to UTC at the NTP reply path), so the fork converts
+  the reading through the standard TAI → UTC leap-second table (`utc_now()`)
+  before displaying it; without that the page would run ~37 s fast.
+- **Configuration** — `WEB_STATUS_SERVER_ENABLED` (default `1` in this fork)
+  and `WebStatusPort` (default `80`).
+- **Isolation** — the server runs on **FreeRTOS core 0** at **priority 5**
+  (below every time-sensitive task, which stay pinned to core 1 and the
+  higher-priority NTP tasks), with a 4 KB stack and a fixed-size response
+  buffer, so HTML/JSON rendering can never interfere with the timing-critical
+  work.
+- **Hardening** — the request receive timeout is bounded, the response buffer
+  is reused safely (the httpd server services all connections serially from a
+  single task, so two handlers are never in flight at once), and every string
+  field is length-bounded so the fixed buffer cannot overflow.
+
+> **Security note:** the status server has **no authentication** and is intended
+> for a trusted LAN only. Anyone on the same network can read the page and the
+> `/status` JSON (which includes the device IP, firmware version, and counters).
+> There is no write or control path. If you want it on a network you do not
+> fully trust, either disable it (`WEB_STATUS_SERVER_ENABLED 0`) or segment the
+> device onto a separate VLAN.
+
+### Supporting changes
+
+- PPS startup qualification is handled by upstream 4.0.X itself: PPS edges
+  are qualified from the measured interval between true captured edges (the
+  `approximate_edge_us` field of the captured PPS event), so the fork adds
+  nothing on that front.
+- The web server source includes `ESP32TimeServerSettings.h` **before** its
+  `#if WEB_STATUS_SERVER_ENABLED` guard (the guard must see the macro), and
+  uses the ESP-IDF v6.1 `recv_wait_timeout` (seconds) field of the httpd config.
+- The web status httpd instance sets `ctrl_port = 32769`. Every
+  `esp_http_server` instance binds an internal loopback UDP control socket on
+  `127.0.0.1:<ctrl_port>`, and both default to 32768 — the OTE server starts
+  first and takes that port, so without the explicit 32769 the web status
+  server fails `httpd_start` with EADDRINUSE and port 80 never opens.
+
+### Build
+
+The new code is wired into `main/CMakeLists.txt`, which reads the settings
+header and compiles `custom/web_status.cpp` (plus the `esp_http_server`
+component) only when `WEB_STATUS_SERVER_ENABLED` is `1`. The rest of the build
+is unchanged — use the same `idf.py ... set-target esp32p4 build` commands
+described in the **Setup** section below.
+
+#### Applying the fork as a patch (instead of cloning it)
+
+The complete fork change set is also carried as a single unified diff,
+`patches/mtk-web-status-full-v40.patch` (five files: three modified, two
+added). If you would rather keep a pristine upstream checkout, apply the
+patch onto the upstream commit it was generated against:
+
+```
+git clone https://github.com/roblatour/ESP32TimeServer.git
+cd ESP32TimeServer
+git checkout f117796   # upstream 4.0.0 — the commit the patch was built from
+git apply --check /path/to/patches/mtk-web-status-full-v40.patch
+git apply /path/to/patches/mtk-web-status-full-v40.patch
+```
+
+(`patch -p1 < patches/mtk-web-status-full-v40.patch` works the same way if
+you prefer not to use git.) If the `--check` step fails, your checkout is not
+exactly at `f117796` — the patch is a plain diff and will not apply to other
+upstream revisions.
+
+After applying, review the GNSS receiver settings in
+`main/ESP32TimeServerSettings.h`: the patch ships the fork's defaults for an
+MTK3339 receiver (`UBLOX_COMPLIANT_GNSS_RECEIVER_ENABLED 0` and
+`baudRateForUbloxNonCompliantGNSSReceiver 9600`). Flip both back to
+`1` / `115200` for a u-blox receiver. Everything else is identical to
+cloning the fork — build with the standard `idf.py` commands from the
+**Setup** section below.
+
+---
+
 ## Hardware
 
 
@@ -264,7 +399,7 @@ cd \temp\ESP32TimeserverProject
 ```
 
 ```cmd
-git clone https://github.com/roblatour/ESP32TimeServer
+git clone https://github.com/SinclairKS/ESP32TimeServer
 ```
 
 ```cmd
@@ -407,11 +542,11 @@ file for details.
 
 ## Supporting This Project
 
-To help support this project, or to just say thanks, you're welcome to 'buy me a
-coffee'.
+To help support this project's original author or to just say thanks, without
+whom this fork would not exist, you're welcome to 'buy him a coffee'.
 
 [<img alt="buy me a coffee" width="200px" src="https://cdn.buymeacoffee.com/buttons/v2/default-blue.png" />](https://www.buymeacoffee.com/roblatour)
 
 ---
 
-Copyright © 2026 Rob Latour
+Copyright © 2026 Rob Latour and SinclairKS
