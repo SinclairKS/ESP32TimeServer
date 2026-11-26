@@ -956,7 +956,7 @@ index 0000000..8e120d1
 +
 +#endif
 diff --git a/main/main.cpp b/main/main.cpp
-index 542f0c7..1ed39c1 100644
+index 542f0c7..00b9aba 100644
 --- a/main/main.cpp
 +++ b/main/main.cpp
 @@ -61,6 +61,12 @@
@@ -1341,7 +1341,26 @@ index 542f0c7..1ed39c1 100644
  #endif
  
  #if DEBUG_ENABLED
-@@ -11636,6 +11988,9 @@ static void validate_board_configuration()
+@@ -9328,6 +9680,18 @@ void write_opening_messages_to_the_console()
+ #endif
+ #endif
+ 
++#if WEB_STATUS_SERVER_ENABLED
++    ESP_LOGI(TAG, "Web status server support: Enabled");
++#else
++    ESP_LOGW(TAG, "Web status server support: Disabled");
++#endif
++
++#if SERIAL_CONSOLE_ENABLED
++    ESP_LOGI(TAG, "Serial console support: Enabled");
++#else
++    ESP_LOGW(TAG, "Serial console support: Disabled");
++#endif
++
+     ESP_LOGI(TAG, "");
+ }
+ 
+@@ -11636,6 +12000,9 @@ static void validate_board_configuration()
  
  extern "C" void app_main()
  {
@@ -1351,7 +1370,7 @@ index 542f0c7..1ed39c1 100644
  
      check_NTP_and_PTP_settings();
  
-@@ -11674,6 +12029,10 @@ extern "C" void app_main()
+@@ -11674,6 +12041,10 @@ extern "C" void app_main()
  
      setup_for_ote_updates();
  

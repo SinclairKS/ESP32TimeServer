@@ -9680,6 +9680,18 @@ void write_opening_messages_to_the_console()
 #endif
 #endif
 
+#if WEB_STATUS_SERVER_ENABLED
+    ESP_LOGI(TAG, "Web status server support: Enabled");
+#else
+    ESP_LOGW(TAG, "Web status server support: Disabled");
+#endif
+
+#if SERIAL_CONSOLE_ENABLED
+    ESP_LOGI(TAG, "Serial console support: Enabled");
+#else
+    ESP_LOGW(TAG, "Serial console support: Disabled");
+#endif
+
     ESP_LOGI(TAG, "");
 }
 
