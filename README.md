@@ -542,8 +542,8 @@ file for details.
 
 ## Supporting This Project
 
-To help support this project's original author or to just say thanks, without
-whom this fork would not exist, you're welcome to 'buy him a coffee'.
+To help support this project's original author, without whom this fork would
+not exist, or to just say thanks you're welcome to 'buy him a coffee'.
 
 [<img alt="buy me a coffee" width="200px" src="https://cdn.buymeacoffee.com/buttons/v2/default-blue.png" />](https://www.buymeacoffee.com/roblatour)
 
